@@ -1,8 +1,11 @@
 from random import randint
-import sys, traceback, threading, socket
+import sys, traceback, threading, socket, time
 
 from VideoStream import VideoStream
+from HDVideoStream import HDVideoStream
 from RtpPacket import RtpPacket
+from FragmentationHandler import FragmentationHandler
+from NetworkAnalytics import NetworkAnalytics
 
 
 class ServerWorker:
@@ -24,6 +27,13 @@ class ServerWorker:
 
     def __init__(self, clientInfo):
         self.clientInfo = clientInfo
+        self.fragmentation_handler = FragmentationHandler()
+        self.network_analytics = NetworkAnalytics()
+        self.hd_mode = False  # Flag for HD mode
+        self.use_adaptive_bitrate = True
+        self.frame_seqnum = 0
+        self.last_bitrate_adjustment = time.time()
+        self.bytes_sent_since_last_check = 0
 
     def run(self):
         threading.Thread(target=self.recvRtspRequest).start()
@@ -50,6 +60,18 @@ class ServerWorker:
         # Get the RTSP sequence number
         seq = request[1].split(" ")
 
+        # Check for HD mode request
+        hd_mode = False
+        for line in request:
+            if "Resolution:" in line:
+                res = line.split("Resolution:")[1].strip()
+                if "1080" in res:
+                    hd_mode = True
+                    self.hd_mode = True
+                elif "720" in res:
+                    self.hd_mode = True
+                break
+
         # Process SETUP request
         if requestType == self.SETUP:
             if self.state == self.INIT:
@@ -57,7 +79,21 @@ class ServerWorker:
                 print("processing SETUP\n")
 
                 try:
-                    self.clientInfo["videoStream"] = VideoStream(filename)
+                    # Try HD video stream first if HD mode requested
+                    if self.hd_mode:
+                        try:
+                            self.clientInfo["videoStream"] = HDVideoStream(
+                                filename, 
+                                resolution=HDVideoStream.RESOLUTION_1080P,
+                                fps=30
+                            )
+                            print(f"HD Video Stream loaded: 1080p@30fps")
+                        except:
+                            self.clientInfo["videoStream"] = VideoStream(filename)
+                            self.hd_mode = False
+                    else:
+                        self.clientInfo["videoStream"] = VideoStream(filename)
+                    
                     self.state = self.READY
                 except IOError:
                     self.replyRtsp(self.FILE_NOT_FOUND_404, seq[1])
@@ -119,7 +155,7 @@ class ServerWorker:
             self.clientInfo["rtpSocket"].close()
 
     def sendRtp(self):
-        """Send RTP packets over UDP."""
+        """Send RTP packets over UDP with fragmentation and adaptive bitrate control."""
         while True:
             self.clientInfo["event"].wait(0.05)
 
@@ -127,20 +163,49 @@ class ServerWorker:
             if self.clientInfo["event"].isSet():
                 break
 
+            # Adaptive bitrate control (check every second)
+            current_time = time.time()
+            if current_time - self.last_bitrate_adjustment >= 1.0 and self.use_adaptive_bitrate:
+                self.network_analytics.update_bandwidth_sample(
+                    self.bytes_sent_since_last_check,
+                    current_time - self.last_bitrate_adjustment
+                )
+                self.bytes_sent_since_last_check = 0
+                self.last_bitrate_adjustment = current_time
+
             data = self.clientInfo["videoStream"].nextFrame()
             if data:
                 frameNumber = self.clientInfo["videoStream"].frameNbr()
+                self.frame_seqnum += 1
+                
+                # Record frame sent
+                self.network_analytics.record_frame_sent(frameNumber, len(data))
+                
                 try:
                     address = self.clientInfo["rtspSocket"][1][0]
                     port = int(self.clientInfo["rtpPort"])
-                    self.clientInfo["rtpSocket"].sendto(
-                        self.makeRtp(data, frameNumber), (address, port)
-                    )
-                except:
-                    print("Connection Error")
-                    # print('-'*60)
-                    # traceback.print_exc(file=sys.stdout)
-                    # print('-'*60)
+                    
+                    # Handle fragmentation if frame exceeds MTU
+                    if len(data) > self.fragmentation_handler.max_payload_size:
+                        fragments = self.fragmentation_handler.fragment_frame(data, frameNumber)
+                        for frag_header, frag_payload in fragments:
+                            # Create RTP packet with fragmentation header prepended
+                            rtp_payload = frag_header + frag_payload
+                            rtp_packet = self.makeRtp(rtp_payload, self.frame_seqnum)
+                            self.clientInfo["rtpSocket"].sendto(rtp_packet, (address, port))
+                            self.bytes_sent_since_last_check += len(rtp_packet)
+                            self.frame_seqnum += 1
+                            # Small delay between fragments for better network handling
+                            time.sleep(0.001)
+                    else:
+                        # Single packet, add minimal fragmentation header
+                        rtp_packet = self.makeRtp(data, self.frame_seqnum)
+                        self.clientInfo["rtpSocket"].sendto(rtp_packet, (address, port))
+                        self.bytes_sent_since_last_check += len(rtp_packet)
+                    
+                except Exception as e:
+                    print(f"Connection Error: {e}")
+                    self.network_analytics.record_packet_loss(frameNumber)
 
     def makeRtp(self, payload, frameNbr):
         """RTP-packetize the video data."""
@@ -165,11 +230,13 @@ class ServerWorker:
         """Send RTSP reply to the client."""
         if code == self.OK_200:
             # print("200 OK")
+            hd_info = "\nHD-Mode: 1080p" if self.hd_mode else ""
             reply = (
                 "RTSP/1.0 200 OK\nCSeq: "
                 + seq
                 + "\nSession: "
                 + str(self.clientInfo["session"])
+                + hd_info
             )
             connSocket = self.clientInfo["rtspSocket"][0]
             connSocket.send(reply.encode())
@@ -179,3 +246,7 @@ class ServerWorker:
             print("404 NOT FOUND")
         elif code == self.CON_ERR_500:
             print("500 CONNECTION ERROR")
+    
+    def get_analytics_summary(self):
+        """Get network analytics summary."""
+        return self.network_analytics.get_statistics_summary()

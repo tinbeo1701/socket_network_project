@@ -1,8 +1,10 @@
 from tkinter import *
 import tkinter.messagebox
 from PIL import Image, ImageTk
-import socket, threading, sys, traceback, os
+import socket, threading, sys, traceback, os, time
 from RtpPacket import RtpPacket
+from FragmentationHandler import FragmentationHandler, FragmentationHeader
+from NetworkAnalytics import NetworkAnalytics
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
@@ -19,10 +21,9 @@ class Client:
     PAUSE = 2
     TEARDOWN = 3
 
-    def __init__(self, master, serveraddr, serverport, rtpport, filename):
+    def __init__(self, master, serveraddr, serverport, rtpport, filename, hd_mode=False):
         self.master = master
         self.master.protocol("WM_DELETE_WINDOW", self.handler)
-        self.createWidgets()
         self.serverAddr = serveraddr
         self.serverPort = int(serverport)
         self.rtpPort = int(rtpport)
@@ -31,10 +32,31 @@ class Client:
         self.sessionId = 0
         self.requestSent = -1
         self.teardownAcked = 0
-        self.connectToServer()
         self.frameNbr = 0
+        
+        # HD streaming support
+        self.hd_mode = hd_mode
+        self.fragmentation_handler = FragmentationHandler()
+        self.network_analytics = NetworkAnalytics()
+        self.last_seq_num = -1
+        
+        # Frame reassembly buffer
+        self.reassembly_buffer = {}
+        
+        # Low-latency playback buffer
+        self.frame_queue = []
+        self.max_queue_size = 3
+        self.queue_lock = threading.Lock()
+        
+        # Analytics display
+        self.stats_update_interval = 1.0  # seconds
+        self.last_stats_update = time.time()
+        
+        self.createWidgets()
+        self.connectToServer()
 
     def createWidgets(self):
+        # Control buttons
         self.setup = Button(self.master, width=20, padx=3, pady=3)
         self.setup["text"] = "Setup"
         self.setup["command"] = self.setupMovie
@@ -55,10 +77,15 @@ class Client:
         self.teardown["command"] = self.exitClient
         self.teardown.grid(row=1, column=3, padx=2, pady=2)
 
+        # Video display label
         self.label = Label(self.master, height=19)
         self.label.grid(
             row=0, column=0, columnspan=4, sticky=W + E + N + S, padx=5, pady=5
         )
+        
+        # Analytics display
+        self.stats_label = Label(self.master, text="", justify=LEFT, font=("Arial", 9))
+        self.stats_label.grid(row=2, column=0, columnspan=4, sticky=W + E, padx=5, pady=5)
 
     def setupMovie(self):
         if self.state == self.INIT:
@@ -81,9 +108,12 @@ class Client:
             threading.Thread(target=self.listenRtp).start()
             self.playEvent = threading.Event()
             self.playEvent.clear()
+            # Start frame display for low-latency playback
+            self.master.after(33, self.display_queued_frames)  # ~30 FPS
             self.sendRtspRequest(self.PLAY)
 
     def listenRtp(self):
+        """Listen for RTP packets with fragmentation support and low-latency buffering."""
         while True:
             try:
                 data = self.rtpSocket.recv(20480)
@@ -91,10 +121,57 @@ class Client:
                     rtpPacket = RtpPacket()
                     rtpPacket.decode(data)
                     currFrameNbr = rtpPacket.seqNum()
-                    print("Current Seq Num: " + str(currFrameNbr))
-                    if currFrameNbr > self.frameNbr:
-                        self.frameNbr = currFrameNbr
-                        self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+                    payload = rtpPacket.getPayload()
+                    
+                    # Check for packet loss
+                    if self.last_seq_num >= 0 and currFrameNbr > self.last_seq_num + 1:
+                        lost_count = currFrameNbr - self.last_seq_num - 1
+                        self.network_analytics.record_packet_loss(currFrameNbr, lost_count)
+                        print(f"Packet loss detected: {lost_count} packets")
+                    
+                    self.last_seq_num = currFrameNbr
+                    
+                    # Try to extract fragmentation header
+                    frag_header = FragmentationHeader()
+                    if len(payload) >= FragmentationHeader.HEADER_SIZE:
+                        if frag_header.decode(payload[:FragmentationHeader.HEADER_SIZE]):
+                            # Fragmented payload
+                            frame_payload = payload[FragmentationHeader.HEADER_SIZE:]
+                            
+                            # Try to reassemble
+                            complete_frame = self.fragmentation_handler.add_fragment(
+                                frag_header.fragment_id, 
+                                frag_header, 
+                                frame_payload
+                            )
+                            
+                            if complete_frame:
+                                # Frame is complete
+                                self.frameNbr = frag_header.fragment_id
+                                self.network_analytics.record_frame_received(
+                                    frag_header.fragment_id, 
+                                    len(complete_frame)
+                                )
+                                self.add_to_queue(complete_frame)
+                        else:
+                            # Not fragmented, use as-is
+                            if currFrameNbr > self.frameNbr:
+                                self.frameNbr = currFrameNbr
+                                self.network_analytics.record_frame_received(currFrameNbr, len(payload))
+                                self.add_to_queue(payload)
+                    else:
+                        # Small payload, not fragmented
+                        if currFrameNbr > self.frameNbr:
+                            self.frameNbr = currFrameNbr
+                            self.network_analytics.record_frame_received(currFrameNbr, len(payload))
+                            self.add_to_queue(payload)
+                    
+                    # Update statistics display
+                    current_time = time.time()
+                    if current_time - self.last_stats_update >= self.stats_update_interval:
+                        self.update_stats_display()
+                        self.last_stats_update = current_time
+                        
             except:
                 if self.playEvent.isSet():
                     break
@@ -102,6 +179,21 @@ class Client:
                     self.rtpSocket.shutdown(socket.SHUT_RDWR)
                     self.rtpSocket.close()
                     break
+    
+    def add_to_queue(self, frame_data):
+        """Add frame to low-latency queue."""
+        with self.queue_lock:
+            # Keep queue size limited for low-latency
+            if len(self.frame_queue) >= self.max_queue_size:
+                self.frame_queue.pop(0)  # Remove oldest
+            self.frame_queue.append(frame_data)
+    
+    def get_queued_frame(self):
+        """Get next frame from queue (FIFO)."""
+        with self.queue_lock:
+            if self.frame_queue:
+                return self.frame_queue.pop(0)
+        return None
 
     def writeFrame(self, data):
         cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
@@ -110,9 +202,39 @@ class Client:
         return cachename
 
     def updateMovie(self, imageFile):
-        photo = ImageTk.PhotoImage(Image.open(imageFile))
-        self.label.configure(image=photo, height=288)
-        self.label.image = photo
+        """Update movie display with low-latency frame."""
+        try:
+            photo = ImageTk.PhotoImage(Image.open(imageFile))
+            self.label.configure(image=photo, height=288)
+            self.label.image = photo
+        except Exception as e:
+            print(f"Error updating movie: {e}")
+    
+    def display_queued_frames(self):
+        """Display queued frames for low-latency playback."""
+        frame_data = self.get_queued_frame()
+        if frame_data:
+            try:
+                cache_name = self.writeFrame(frame_data)
+                self.updateMovie(cache_name)
+            except Exception as e:
+                print(f"Error displaying frame: {e}")
+        
+        # Schedule next display
+        if self.state == self.PLAYING and not self.playEvent.isSet():
+            self.master.after(33, self.display_queued_frames)  # ~30 FPS
+    
+    def update_stats_display(self):
+        """Update network statistics display."""
+        stats = self.network_analytics.get_statistics_summary()
+        stats_text = (
+            f"Frame Loss: {stats['frame_loss_rate']} | "
+            f"Packet Loss: {stats['packet_loss_rate']} | "
+            f"Latency: {stats['average_latency_ms']}ms | "
+            f"Bitrate: {stats['current_bitrate_mbps']}Mbps | "
+            f"Jitter: {stats['jitter_ms']}ms"
+        )
+        self.stats_label.config(text=stats_text)
 
     def connectToServer(self):
         self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -128,7 +250,9 @@ class Client:
         if requestCode == self.SETUP and self.state == self.INIT:
             threading.Thread(target=self.recvRtspReply).start()
             self.rtspSeq += 1
-            request = f"SETUP {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nTransport: RTP/UDP; client_port={self.rtpPort}"
+            # Add resolution header for HD mode
+            resolution_header = "\nResolution: 1080p" if self.hd_mode else ""
+            request = f"SETUP {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nTransport: RTP/UDP; client_port={self.rtpPort}{resolution_header}"
             self.requestSent = self.SETUP
 
         elif requestCode == self.PLAY and self.state == self.READY:

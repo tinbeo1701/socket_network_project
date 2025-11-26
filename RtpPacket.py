@@ -87,6 +87,7 @@ class RtpPacket:
 
 		self.header = header
 		self.payload = payload
+		self.timestamp_val = timestamp
 		
 	def decode(self, byteStream):
 		"""Decode the RTP packet."""
@@ -112,10 +113,26 @@ class RtpPacket:
 		pt = self.header[1] & 127
 		return int(pt)
 	
+	def marker(self):
+		"""Return marker bit."""
+		return (self.header[1] >> 7) & 1
+	
+	def cc(self):
+		"""Return CSRC count."""
+		return self.header[0] & 0x0F
+	
 	def getPayload(self):
 		"""Return payload."""
 		return self.payload
+	
+	def getPayloadSize(self):
+		"""Return payload size."""
+		return len(self.payload)
 		
 	def getPacket(self):
 		"""Return RTP packet."""
 		return self.header + self.payload
+	
+	def getPacketSize(self):
+		"""Return total packet size."""
+		return len(self.header) + len(self.payload)
