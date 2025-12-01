@@ -9,7 +9,6 @@ from NetworkAnalytics import NetworkAnalytics
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
 
-
 class Client:
     INIT = 0
     READY = 1
@@ -33,6 +32,9 @@ class Client:
         self.requestSent = -1
         self.teardownAcked = 0
         self.frameNbr = 0
+
+        self.playEvent = threading.Event()
+        self.playEvent.clear()
         
         # HD streaming support
         self.hd_mode = hd_mode
@@ -47,9 +49,11 @@ class Client:
         self.frame_queue = []
         self.max_queue_size = 3
         self.queue_lock = threading.Lock()
-        
+        self.display_started = False
+        self.rtp_thread_stop_event = threading.Event()
+
         # Analytics display
-        self.stats_update_interval = 1.0  # seconds
+        self.stats_update_interval = 1.0 # seconds
         self.last_stats_update = time.time()
         
         self.createWidgets()
@@ -101,20 +105,27 @@ class Client:
 
     def pauseMovie(self):
         if self.state == self.PLAYING:
+            self.rtp_thread_stop_event.set()
             self.sendRtspRequest(self.PAUSE)
+            
+            # Reset flags for playback restart
+            with self.queue_lock:
+                self.display_started = False  # allow playback to restart
+                self.frame_queue.clear()      # optionally clear old frames
 
+                
     def playMovie(self):
         if self.state == self.READY:
-            threading.Thread(target=self.listenRtp).start()
-            self.playEvent = threading.Event()
-            self.playEvent.clear()
-            # Start frame display for low-latency playback
-            self.master.after(33, self.display_queued_frames)  # ~30 FPS
+            self.rtp_thread_stop_event.clear()
+            self.playEvent.clear()  # reset event for new playback
+
+            threading.Thread(target=self.listenRtp, daemon=True).start()
             self.sendRtspRequest(self.PLAY)
 
     def listenRtp(self):
         """Listen for RTP packets with fragmentation support and low-latency buffering."""
-        while True:
+        print("RTP Listener started.")
+        while not self.rtp_thread_stop_event.is_set():
             try:
                 data = self.rtpSocket.recv(20480)
                 if data:
@@ -123,13 +134,11 @@ class Client:
                     currFrameNbr = rtpPacket.seqNum()
                     payload = rtpPacket.getPayload()
                     
-                    # Check for packet loss
-                    if self.last_seq_num >= 0 and currFrameNbr > self.last_seq_num + 1:
-                        lost_count = currFrameNbr - self.last_seq_num - 1
-                        print(f"Packet loss detected: {lost_count} packets")
-                    
+                    # Disable false packet loss reporting (fragmentation causes seq gaps)
+                    if self.last_seq_num >= 0 and currFrameNbr < self.last_seq_num:
+                        print("Out-of-order packet detected")
                     self.last_seq_num = currFrameNbr
-                                        
+
                     # Try to extract fragmentation header
                     frag_header = FragmentationHeader()
                     if len(payload) >= FragmentationHeader.HEADER_SIZE:
@@ -171,21 +180,33 @@ class Client:
                         self.update_stats_display()
                         self.last_stats_update = current_time
                         
-            except:
-                if self.playEvent.isSet():
-                    break
+            except socket.timeout:
+                continue
+            except Exception as e:
                 if self.teardownAcked == 1:
+                    print("RTP Listener stopping due to Teardown.")
                     self.rtpSocket.shutdown(socket.SHUT_RDWR)
                     self.rtpSocket.close()
                     break
+                
+                if self.rtp_thread_stop_event.is_set():
+                    break
+
+        print("RTP Listener stopped.")
     
     def add_to_queue(self, frame_data):
-        """Add frame to low-latency queue."""
+        """Add frame to low-latency queue (Client-Side Caching Logic)."""
         with self.queue_lock:
-            # Keep queue size limited for low-latency
+            # 1. Quản lý kích thước queue (FIFO)
             if len(self.frame_queue) >= self.max_queue_size:
                 self.frame_queue.pop(0)  # Remove oldest
             self.frame_queue.append(frame_data)
+            
+            if (len(self.frame_queue) == self.max_queue_size) and (not self.display_started):
+                print(f"Pre-buffer complete: starting playback with {self.max_queue_size} frames.")
+                self.display_started = True
+                # Bắt đầu vòng lặp hiển thị frame trên luồng chính (Main Thread)
+                self.master.after(1, self.display_queued_frames) 
     
     def get_queued_frame(self):
         """Get next frame from queue (FIFO)."""
@@ -221,7 +242,7 @@ class Client:
         
         # Schedule next display
         if self.state == self.PLAYING and not self.playEvent.isSet():
-            self.master.after(33, self.display_queued_frames)  # ~30 FPS
+            self.master.after(33, self.display_queued_frames) # ~30 FPS
     
     def update_stats_display(self):
         """Update network statistics display."""
