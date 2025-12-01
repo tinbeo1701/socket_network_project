@@ -123,9 +123,11 @@ class Client:
                     currFrameNbr = rtpPacket.seqNum()
                     payload = rtpPacket.getPayload()
                     
-                    # Disable false packet loss reporting (fragmentation causes seq gaps)
-                    if self.last_seq_num >= 0 and currFrameNbr < self.last_seq_num:
-                        print("Out-of-order packet detected")
+                    # Check for packet loss
+                    if self.last_seq_num >= 0 and currFrameNbr > self.last_seq_num + 1:
+                        lost_count = currFrameNbr - self.last_seq_num - 1
+                        print(f"Packet loss detected: {lost_count} packets")
+                    
                     self.last_seq_num = currFrameNbr
                                         
                     # Try to extract fragmentation header
